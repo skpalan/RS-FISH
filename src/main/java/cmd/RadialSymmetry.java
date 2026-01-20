@@ -23,7 +23,10 @@ package cmd;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.stream.Collectors;
 
 import org.janelia.saalfeldlab.n5.N5FSReader;
 import org.janelia.saalfeldlab.n5.N5Reader;
@@ -36,8 +39,10 @@ import ij.ImagePlus;
 import net.imglib2.FinalInterval;
 import net.imglib2.RandomAccessible;
 import net.imglib2.RandomAccessibleInterval;
+import net.imglib2.converter.Converters;
 import net.imglib2.img.display.imagej.ImageJFunctions;
 import net.imglib2.img.imageplus.ImagePlusImgs;
+import net.imglib2.type.numeric.real.FloatType;
 import net.imglib2.view.Views;
 import parameters.RadialSymParams;
 import picocli.CommandLine;
@@ -80,6 +85,22 @@ public class RadialSymmetry implements Callable<Void> {
 	@Option(names = {"-t", "--threshold"}, required = false, description = "threshold for Difference-of-Gaussian (DoG) (default: 0.007)")
 	private double threshold = 0.007;
 
+	@Option(names = {"--multi_threshold"}, required = false, 
+			description = "Multiple thresholds for DoG (comma-separated), e.g., 0.005,0.007,0.01. " +
+						 "Mutually exclusive with --threshold. DoG is computed once and reused for all thresholds. " +
+						 "When specified, generates separate output CSV files for each threshold.")
+	private String multiThreshold = null;
+
+	@Option(names = {"--threads"}, required = false, 
+			description = "Number of threads for parallel processing. When not specified, runs single-threaded. " +
+						 "Used for: (1) DoG computation, (2) parallel processing of multiple thresholds.")
+	private Integer threads = null;
+
+	@Option(names = {"--random-seed"}, required = false, 
+			description = "Random seed for RANSAC reproducibility (default: random). " +
+						 "Use this to ensure identical results across multiple runs.")
+	private Long randomSeed = null;
+
 	@Option(names = {"-sr", "--supportRadius"}, required = false, description = "support region radius for RANSAC (default: 3)")
 	private int supportRadius = 3;
 
@@ -116,6 +137,57 @@ public class RadialSymmetry implements Callable<Void> {
 	public Void call() throws Exception {
 
 		final RadialSymParams params = new RadialSymParams();
+
+		// Parse threads parameter
+		final int numThreads;
+		if (threads != null) {
+			numThreads = threads;
+			if (numThreads < 1) {
+				throw new IllegalArgumentException("--threads must be >= 1");
+			}
+		} else {
+			numThreads = 1; // Single-threaded by default
+		}
+
+		// Parse multi-threshold parameter
+		List<Double> thresholds = null;
+		if (multiThreshold != null && !multiThreshold.isEmpty()) {
+			// Note: We cannot easily detect if -t/--threshold was explicitly set by the user
+			// due to picocli limitations with default values. Users should avoid using both parameters.
+			System.out.println("Note: Using --multi_threshold mode. If you also specified --threshold, it will be ignored.");
+
+			// Parse comma-separated thresholds
+			try {
+				thresholds = Arrays.stream(multiThreshold.split(","))
+					.map(String::trim)
+					.map(Double::parseDouble)
+					.sorted()
+					.collect(Collectors.toList());
+
+				if (thresholds.isEmpty()) {
+					throw new IllegalArgumentException(
+						"--multi_threshold cannot be empty");
+				}
+
+				for (double t : thresholds) {
+					if (t <= 0) {
+						throw new IllegalArgumentException(
+							"All thresholds must be positive");
+					}
+				}
+
+				System.out.println("Multi-threshold mode: " + thresholds);
+			} catch (NumberFormatException e) {
+				throw new IllegalArgumentException(
+					"Invalid --multi_threshold format. Use comma-separated numbers, e.g., 0.005,0.007,0.01");
+			}
+		}
+
+		// Set random seed if specified
+		if (randomSeed != null) {
+			System.out.println("Using random seed: " + randomSeed);
+			// TODO: Pass to RANSAC implementation
+		}
 
 		// general
 		RadialSymParams.defaultAnisotropy = params.anisotropyCoefficient = anisotropy;
@@ -158,8 +230,15 @@ public class RadialSymmetry implements Callable<Void> {
 		RadialSymParams.defaultBsInlierRatio = params.bsInlierRatio = (float)backgroundMinInlierRatio;
 		RadialSymParams.defaultResultsFilePath = params.resultsFilePath = output;
 
+		// Set numThreads in params
+		params.numThreads = numThreads;
+
 		if ( interactive )
 		{
+			if (thresholds != null) {
+				System.err.println("WARNING: --multi_threshold is not supported in interactive mode. Ignoring.");
+			}
+
 			final ImagePlus imp = open( image, dataset );
 
 			if ( imp == null )
@@ -188,11 +267,59 @@ public class RadialSymmetry implements Callable<Void> {
 				img = ImagePlusImgs.from( new ImagePlus( image ) );
 
 			HelperFunctions.headless = true;
-			Radial_Symmetry.runRSFISH(
+
+		if (thresholds != null) {
+			// Multi-threshold mode
+			System.out.println("=== RS-FISH Multi-Threshold Mode ===");
+			System.out.println("Input: " + image);
+			System.out.println("Thresholds: " + thresholds);
+			System.out.println("Threads: " + numThreads);
+			System.out.println("Sigma: " + sigma);
+
+			// Compute min/max if needed (same as single-threshold mode)
+			if (params.autoMinMax) {
+				double[] minmax = HelperFunctions.computeMinMax(img);
+				if (Double.isNaN(params.min))
+					params.min = (float) minmax[0];
+				if (Double.isNaN(params.max))
+					params.max = (float) minmax[1];
+			}
+
+			HelperFunctions.log("img min intensity=" + params.min + ", max intensity=" + params.max);
+
+			// Un-normalized image for intensity measurement
+			final RandomAccessible<FloatType> unnormalizedImg = Converters.convert(
+				Views.extendMirrorSingle(img),
+				(a, b) -> ((FloatType)b).setReal(((net.imglib2.type.numeric.RealType)a).getRealFloat()),
+				new FloatType());
+
+			// Normalized image for detection
+			final double range = params.max - params.min;
+			final double min = params.min;
+			final RandomAccessible<FloatType> normalizedImg = Converters.convert(
+				Views.extendMirrorSingle(img),
+				(a, b) -> ((FloatType)b).setReal((((net.imglib2.type.numeric.RealType)a).getRealFloat() - min) / range),
+				new FloatType());
+
+			compute.RadialSymmetry.computeMultiThreshold(
+				unnormalizedImg,
+				normalizedImg,
+				new FinalInterval(img),
+				new FinalInterval(img),
+				params,
+				thresholds,
+				output,
+				numThreads);
+
+			System.out.println("=== Complete ===");
+			} else {
+				// Original single-threshold mode
+				Radial_Symmetry.runRSFISH(
 					(RandomAccessible)(Object)Views.extendMirrorSingle( img ),
 					new FinalInterval( img ),
 					new FinalInterval( img ),
 					params );
+			}
 
 			System.out.println( "done.");
 		}

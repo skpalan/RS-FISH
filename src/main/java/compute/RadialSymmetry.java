@@ -22,6 +22,12 @@
 package compute;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
 import background.NormalizedGradient;
 import background.NormalizedGradientAverage;
@@ -37,12 +43,14 @@ import net.imglib2.Interval;
 import net.imglib2.KDTree;
 import net.imglib2.Point;
 import net.imglib2.RandomAccessible;
-import net.imglib2.algorithm.dog.DogDetection;
 import net.imglib2.neighborsearch.RadiusNeighborSearch;
 import net.imglib2.neighborsearch.RadiusNeighborSearchOnKDTree;
 import net.imglib2.type.numeric.real.FloatType;
 import net.imglib2.util.Util;
 import parameters.RadialSymParams;
+import radial.symmetry.utils.DoGDetection;
+import result.output.ShowResult;
+import gui.Block;
 
 public class RadialSymmetry {
 	public enum Ransac { NONE, SIMPLE, MULTICONSENSU };
@@ -227,12 +235,74 @@ public class RadialSymmetry {
 		if ( calibration.length == 3 )
 			calibration[ 2 ] = useAnisotropy ? (1.0/anisotropy) : 1.0;
 
-		final DogDetection<FloatType> dog2 = new DogDetection<>(pImg, interval, calibration, pSigma, pSigma2,
-				DogDetection.ExtremaType.MINIMA, pThreshold, false);
+		final DoGDetection<FloatType> dog2 = new DoGDetection<>(pImg, interval, calibration, pSigma, pSigma2,
+				DoGDetection.ExtremaType.MINIMA, pThreshold, false);
 
 		dog2.setNumThreads(numThreads);
 
 		return new ArrayList<>( dog2.getPeaks() );
+	}
+
+	/**
+	 * Compute DoG and return peaks with their DoG response values.
+	 * This allows filtering at multiple thresholds without recomputing DoG.
+	 * 
+	 * @param pImg Input image
+	 * @param interval Interval to process
+	 * @param pSigma Sigma for DoG
+	 * @param pThreshold Threshold for DoG (minimum threshold)
+	 * @param anisotropy Anisotropy coefficient
+	 * @param useAnisotropy Whether to use anisotropy
+	 * @param numThreads Number of threads for DoG computation
+	 * @return List of peaks with DoG values
+	 */
+	public static ArrayList<PeakWithDogValue> computeDogWithValues(
+			final RandomAccessible<FloatType> pImg, 
+			final Interval interval, 
+			float pSigma,
+			float pThreshold, 
+			final double anisotropy, 
+			final boolean useAnisotropy, 
+			final int numThreads) {
+
+		float pSigma2 = HelperFunctions.computeSigma2(pSigma, RadialSymParams.defaultSensitivity);
+
+		double[] calibration = new double[pImg.numDimensions()];
+		calibration[0] = 1.0;
+		calibration[1] = 1.0;
+		if (calibration.length == 3)
+			calibration[2] = useAnisotropy ? (1.0/anisotropy) : 1.0;
+
+		final DoGDetection<FloatType> dog2 = new DoGDetection<>(
+			pImg, interval, calibration, pSigma, pSigma2,
+			DoGDetection.ExtremaType.MINIMA, pThreshold, false);
+
+		dog2.setNumThreads(numThreads);
+
+		return new ArrayList<>(dog2.getPeaksWithValues());
+	}
+
+	/**
+	 * Filter peaks by threshold based on their DoG response values.
+	 * For MINIMA (bright blobs): keep peaks where DoG_value < -threshold
+	 * 
+	 * @param allPeaks All peaks with DoG values
+	 * @param threshold Threshold to apply
+	 * @return Filtered peaks
+	 */
+	public static ArrayList<Point> filterPeaksByThreshold(
+			final ArrayList<PeakWithDogValue> allPeaks,
+			final double threshold) {
+
+		final ArrayList<Point> filtered = new ArrayList<>();
+		for (final PeakWithDogValue peak : allPeaks) {
+			// For MINIMA (bright blobs on dark background):
+			// DoG produces negative values, so keep if DoG_value < -threshold
+			if (peak.getDogValue() < -threshold) {
+				filtered.add(new Point(peak));
+			}
+		}
+		return filtered;
 	}
 
 	public static ArrayList<Spot> computeRadialSymmetry(final Interval interval, NormalizedGradient pNg,
@@ -440,5 +510,243 @@ public class RadialSymmetry {
 
 	public NormalizedGradient getNormalizedGradient() {
 		return ng;
+	}
+
+	/**
+	 * Compute multi-threshold detection.
+	 * DoG is computed once and reused for all thresholds.
+	 *
+	 * @param unnormalizedImg Un-normalized image for intensity measurement
+	 * @param normalizedImg Normalized image for detection
+	 * @param globalInterval Global interval
+	 * @param computeInterval Compute interval
+	 * @param baseParams Base parameters
+	 * @param thresholds List of thresholds to process
+	 * @param baseOutputPath Base output file path
+	 * @param numThreads Number of threads for parallel processing
+	 */
+	public static void computeMultiThreshold(
+			final RandomAccessible<FloatType> unnormalizedImg,
+			final RandomAccessible<FloatType> normalizedImg,
+			final Interval globalInterval,
+			final Interval computeInterval,
+			final RadialSymParams baseParams,
+			final List<Double> thresholds,
+			final String baseOutputPath,
+			final int numThreads) {
+
+		HelperFunctions.log("=== Multi-Threshold Detection Mode ===");
+		HelperFunctions.log("Thresholds: " + thresholds);
+		HelperFunctions.log("Threads: " + numThreads);
+
+		// Step 1: Find minimum threshold
+		double minThreshold = Collections.min(thresholds);
+		HelperFunctions.log("Computing DoG with minimum threshold: " + minThreshold);
+
+		// Step 2: Compute DoG ONCE with minimum threshold (multi-threaded)
+		final long dogStartTime = System.currentTimeMillis();
+		final ArrayList<PeakWithDogValue> allPeaks = computeDogWithValues(
+			normalizedImg, computeInterval,
+			baseParams.sigma,
+			(float)minThreshold,
+			baseParams.anisotropyCoefficient,
+			baseParams.useAnisotropyForDoG,
+			numThreads);
+
+		final long dogTime = System.currentTimeMillis() - dogStartTime;
+		HelperFunctions.log("DoG completed in " + dogTime + " ms. Found " +
+						   allPeaks.size() + " candidate peaks.");
+
+		// Step 3: Compute gradients ONCE (shared across all thresholds)
+		HelperFunctions.log("Computing gradients...");
+		final Gradient derivative = new GradientOnDemand(normalizedImg);
+		final NormalizedGradient ng = calculateNormalizedGradient(
+			derivative,
+			RadialSymParams.bsMethods[baseParams.bsMethod],
+			baseParams.bsMaxError,
+			baseParams.bsInlierRatio);
+
+		// Step 4: Process each threshold (currently sequential only due to thread-safety constraints)
+		final long rsStartTime = System.currentTimeMillis();
+
+		// TODO: Parallel threshold processing has thread-safety issues with RandomAccessible converters
+		// For now, always use sequential processing
+		HelperFunctions.log("Processing " + thresholds.size() +
+						   " thresholds sequentially...");
+		processThresholdsSequential(
+			unnormalizedImg, globalInterval, ng, derivative, allPeaks,
+			baseParams, thresholds, baseOutputPath);
+
+		final long rsTime = System.currentTimeMillis() - rsStartTime;
+		HelperFunctions.log("RS+RANSAC completed in " + rsTime + " ms.");
+		HelperFunctions.log("Total time: " + (dogTime + rsTime) + " ms.");
+	}
+
+	/**
+	 * Process thresholds sequentially
+	 */
+	private static void processThresholdsSequential(
+			final RandomAccessible<FloatType> unnormalizedImg,
+			final Interval globalInterval,
+			final NormalizedGradient ng,
+			final Gradient derivative,
+			final ArrayList<PeakWithDogValue> allPeaks,
+			final RadialSymParams baseParams,
+			final List<Double> thresholds,
+			final String baseOutputPath) {
+
+		for (Double threshold : thresholds) {
+			processThreshold(unnormalizedImg, globalInterval, ng, derivative, allPeaks,
+						   baseParams, threshold, baseOutputPath);
+		}
+	}
+
+	/**
+	 * Process thresholds in parallel
+	 */
+	private static void processThresholdsParallel(
+			final RandomAccessible<FloatType> unnormalizedImg,
+			final Interval globalInterval,
+			final NormalizedGradient ng,
+			final Gradient derivative,
+			final ArrayList<PeakWithDogValue> allPeaks,
+			final RadialSymParams baseParams,
+			final List<Double> thresholds,
+			final String baseOutputPath,
+			final int numThreads) {
+
+		ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+
+		// Create tasks for each threshold
+		List<Callable<Void>> tasks = thresholds.stream()
+			.map(threshold -> (Callable<Void>) () -> {
+				try {
+					processThreshold(unnormalizedImg, globalInterval, ng, derivative, allPeaks,
+								   baseParams, threshold, baseOutputPath);
+				} catch (Exception e) {
+					HelperFunctions.log("ERROR processing threshold " + threshold + ": " + e.getMessage());
+					e.printStackTrace();
+					throw e;
+				}
+				return null;
+			})
+			.collect(Collectors.toList());
+
+		try {
+			List<java.util.concurrent.Future<Void>> futures = executor.invokeAll(tasks);
+			// Check for exceptions
+			for (java.util.concurrent.Future<Void> future : futures) {
+				try {
+					future.get();  // This will throw if the task threw an exception
+				} catch (java.util.concurrent.ExecutionException e) {
+					HelperFunctions.log("Task failed: " + e.getCause().getMessage());
+					throw new RuntimeException("Threshold processing failed", e.getCause());
+				}
+			}
+		} catch (InterruptedException e) {
+			e.printStackTrace();
+			throw new RuntimeException("Parallel threshold processing interrupted", e);
+		} finally {
+			executor.shutdown();
+		}
+	}
+
+	/**
+	 * Process a single threshold
+	 */
+	private static void processThreshold(
+			final RandomAccessible<FloatType> unnormalizedImg,
+			final Interval globalInterval,
+			final NormalizedGradient ng,
+			final Gradient derivative,
+			final ArrayList<PeakWithDogValue> allPeaks,
+			final RadialSymParams params,
+			final double threshold,
+			final String baseOutputPath) {
+
+		HelperFunctions.log("  Processing threshold=" + threshold);
+
+		// Filter peaks by this threshold
+		ArrayList<Point> filteredPeaks = filterPeaksByThreshold(allPeaks, threshold);
+		HelperFunctions.log("    Filtered peaks: " + filteredPeaks.size());
+
+		// Run Radial Symmetry + RANSAC
+		ArrayList<Spot> spots = computeRadialSymmetry(
+			globalInterval, ng, derivative, filteredPeaks,
+			Util.getArrayFromValue(params.supportRadius, globalInterval.numDimensions()),
+			params.inlierRatio,
+			params.maxError,
+			(float)params.anisotropyCoefficient,
+			params.RANSAC(),
+			params.minNumInliers,
+			params.nTimesStDev1,
+			params.nTimesStDev2);
+
+		// Filter double-detections
+		if (params.RANSAC().ordinal() > 0) {
+			for (int i = spots.size() - 1; i >= 0; --i)
+				if (spots.get(i).inliers.size() == 0)
+					spots.remove(i);
+		}
+
+		filterDoubleDetections(spots, 0.5);
+		HelperFunctions.log("    Final detections: " + spots.size());
+
+		// Compute intensities (same as single-threshold mode)
+		if (params.getIntensityMethod() == 0) {
+			Intensity.calculateIntensitiesLinear(unnormalizedImg, spots);
+		} else if (params.getIntensityMethod() == 1) {
+			Intensity.calulateIntesitiesGF(
+				unnormalizedImg,
+				unnormalizedImg.numDimensions(),
+				params.getAnisotropyCoefficient(),
+				params.getSigmaDoG(),
+				spots,
+				params.supportRadius,
+				params.ransacSelection);
+		} else if (params.getIntensityMethod() == 2) {
+			Intensity.calulateIntesitiesIntegrate(unnormalizedImg, spots, unnormalizedImg.numDimensions());
+		} else {
+			throw new RuntimeException("Unknown intensity compute method: " + params.getIntensityMethod());
+		}
+
+		// Generate output filename with threshold suffix
+		String outputFile = generateOutputFilename(baseOutputPath, threshold);
+
+		// Save results
+		saveMultiThresholdResults(spots, params, outputFile);
+
+		HelperFunctions.log("    Saved to: " + outputFile);
+	}
+
+	/**
+	 * Generate output filename with threshold suffix
+	 */
+	private static String generateOutputFilename(final String basePath, final double threshold) {
+		// Insert "_threshold_X.XXXX" before file extension
+		int dotIndex = basePath.lastIndexOf('.');
+		if (dotIndex > 0) {
+			return String.format("%s_threshold_%.4f%s",
+				basePath.substring(0, dotIndex),
+				threshold,
+				basePath.substring(dotIndex));
+		} else {
+			return String.format("%s_threshold_%.4f.csv", basePath, threshold);
+		}
+	}
+
+	/**
+	 * Save multi-threshold results to CSV
+	 */
+	private static void saveMultiThresholdResults(
+			final ArrayList<Spot> spots,
+			final RadialSymParams params,
+			final String outputFile) {
+
+		// Convert spots to double[] format
+		final List<double[]> points = ShowResult.points(spots, params.intensityThreshold);
+
+		// Write to CSV
+		Block.writeCSV(points, outputFile);
 	}
 }

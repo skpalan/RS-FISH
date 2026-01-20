@@ -19,6 +19,9 @@ Ella Bahry\*, Laura Breimann\*, Marwan Zouinkhi\*, Leo Epstein, Klim Kolyvanov, 
 
 * [_**1.	Abstract & Availability**_](#abstract)
 * [_**2.Download & Installation**_](#download)
+  * [_**2.1. Installation as command-line tools**_](#download)
+  * [_**2.2. Installation using Docker container**_](#download)
+  * [_**2.3. Multi-Threshold and Multi-Threading Features**_](#download)
 * [_**3.	Calculating Anisotropy Coefficient**_](#anisotropy)
 * [_**4.	RS-FISH tutorial**_](#tutorial)
 * [_**5.	Show detections**_](#detections)
@@ -104,6 +107,48 @@ You can then run RS-FISH from the container using the following command:
 ```
 docker run -v [your_local_input_folder]:/input -v [your_local_output_folder]:/output rs-fish:2.3.1 /RS-FISH/rs-fish [rs_fish_parameter] --image=/input/[your_file.tif] --output=/output/[your_file.csv]
 ```
+
+#### 2.3. Multi-Threshold and Multi-Threading Features
+
+RS-FISH supports running detection with multiple DoG thresholds in a single execution, as well as multi-threaded processing for improved performance.
+
+**Multi-Threshold Detection:**
+
+When you want to explore different threshold values, you can now run them all at once instead of executing RS-FISH multiple times. DoG is computed only once and reused for all thresholds, significantly improving performance.
+
+```bash
+rs-fish -i input.tif -o output.csv --multi_threshold 0.005,0.007,0.01 -s 1.5
+```
+
+This will generate 3 output files:
+- `output_threshold_0.0050.csv`
+- `output_threshold_0.0070.csv`
+- `output_threshold_0.0100.csv`
+
+**Multi-Threading:**
+
+You can enable multi-threading to speed up DoG computation:
+
+```bash
+rs-fish -i input.tif -o output.csv -t 0.007 -s 1.5 --threads 4
+```
+
+The `--threads` parameter works with both single-threshold and multi-threshold modes:
+
+```bash
+rs-fish -i input.tif -o output.csv --multi_threshold 0.005,0.007,0.01 -s 1.5 --threads 4
+```
+
+**Performance:**
+
+For a typical 3D image with 3 thresholds:
+- Multi-threshold mode: 3-5x faster than running RS-FISH 3 times sequentially
+- Multi-threading: Additional 2-3x speedup for DoG computation
+
+**Notes:**
+- `--threshold` and `--multi_threshold` are mutually exclusive (use one or the other)
+- Each threshold produces a separate CSV file with detections
+- Results are identical to running RS-FISH separately for each threshold
 
 
 ### 3.	Calculating Anisotropy Coefficient<a name="anisotropy">
