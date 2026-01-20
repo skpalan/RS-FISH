@@ -196,6 +196,17 @@ public class DoGDetection< T extends RealType< T > & NativeType< T > >
 		return typedDogDetection.getPeaks();
 	}
 
+	/**
+	 * Get peaks along with their DoG response values.
+	 * This allows filtering at multiple thresholds without recomputing DoG.
+	 * 
+	 * @return List of peaks with DoG values
+	 */
+	public ArrayList< compute.PeakWithDogValue > getPeaksWithValues()
+	{
+		return typedDogDetection.getPeaksWithValues();
+	}
+
 	public ArrayList< RefinedPeak< Point > > getSubpixelPeaks()
 	{
 		return typedDogDetection.getSubpixelPeaks();
@@ -366,6 +377,71 @@ public class DoGDetection< T extends RealType< T > & NativeType< T > >
 				service.shutdown();
 
 			return peaks;
+		}
+
+		/**
+		 * Get peaks along with their DoG response values.
+		 * This allows filtering at multiple thresholds without recomputing DoG.
+		 * 
+		 * @return List of peaks with DoG values
+		 */
+		public ArrayList< compute.PeakWithDogValue > getPeaksWithValues()
+		{
+			final ExecutorService service;
+			if ( executorService == null )
+				service = Executors.newFixedThreadPool( numThreads );
+			else
+				service = executorService;
+
+			// Compute DoG if not already computed
+			if ( dogImg == null )
+			{
+				dogImg = Util.getArrayOrCellImgFactory( interval, type ).create( interval );
+				final long[] translation = new long[ interval.numDimensions() ];
+				interval.min( translation );
+				dogImg = Views.translate( dogImg, translation );
+
+				final double[][] sigmas = DifferenceOfGaussian.computeSigmas( imageSigma, minf, pixelSize, sigmaSmaller, sigmaLarger );
+				DifferenceOfGaussian.DoG( sigmas[ 0 ], sigmas[ 1 ], input, dogImg, service );
+			}
+
+			// Find local extrema without threshold filtering
+			final F val = type.createVariable();
+			final double minValueT = type.getMinValue();
+			final double maxValueT = type.getMaxValue();
+			final LocalNeighborhoodCheck< Point, F > localNeighborhoodCheck;
+			final double normalization = normalizeMinPeakValue ? ( sigmaLarger / sigmaSmaller - 1.0 ) : 1.0;
+			switch ( extremaType )
+			{
+			case MINIMA:
+				val.setReal( Math.max( Math.min( -minPeakValue * normalization, maxValueT ), minValueT ) );
+				localNeighborhoodCheck = new LocalExtrema.MinimumCheck<>( val );
+				break;
+			case MAXIMA:
+			default:
+				val.setReal( Math.max( Math.min( minPeakValue * normalization, maxValueT ), minValueT ) );
+				localNeighborhoodCheck = new LocalExtrema.MaximumCheck<>( val );
+			}
+			final ArrayList< Point > peaks = LocalExtrema.findLocalExtrema( dogImg, localNeighborhoodCheck, service );
+
+			// Extract DoG values at peak locations
+			final ArrayList< compute.PeakWithDogValue > peaksWithValues = new ArrayList<>();
+			final net.imglib2.RandomAccess< F > dogAccess = dogImg.randomAccess();
+
+			for ( final Point peak : peaks )
+			{
+				dogAccess.setPosition( peak );
+				final double dogValue = dogAccess.get().getRealDouble();
+				peaksWithValues.add( new compute.PeakWithDogValue( peak, dogValue ) );
+			}
+
+			if ( !keepDoGImg )
+				dogImg = null;
+
+			if ( executorService == null )
+				service.shutdown();
+
+			return peaksWithValues;
 		}
 
 		public ArrayList< RefinedPeak< Point > > getSubpixelPeaks()
