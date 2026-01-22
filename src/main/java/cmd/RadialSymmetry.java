@@ -31,6 +31,7 @@ import java.util.stream.Collectors;
 import org.janelia.saalfeldlab.n5.N5FSReader;
 import org.janelia.saalfeldlab.n5.N5Reader;
 import org.janelia.saalfeldlab.n5.imglib2.N5Utils;
+import org.janelia.saalfeldlab.n5.hdf5.N5HDF5Reader;
 
 import gui.Radial_Symmetry;
 import gui.interactive.HelperFunctions;
@@ -51,10 +52,10 @@ import picocli.CommandLine.Option;
 public class RadialSymmetry implements Callable<Void> {
 
 	// input file
-	@Option(names = {"-i", "--image"}, required = true, description = "input image or N5 container path - if you only provide the image (requires additional -d for N5) the interactive plugin will open, e.g. -i /home/smFish.tif or /home/smFish.n5")
+	@Option(names = {"-i", "--image"}, required = true, description = "input image, N5 container, or HDF5 file path, e.g. -i /home/smFish.tif, /home/smFish.n5, or /home/smFish.h5")
 	private String image = null;
 
-	@Option(names = {"-d", "--dataset"}, required = false, description = "if you selected an N5 path, you need to define the dataset within the N5, e.g. -d 'embryo_5_ch0/c0/s0'")
+	@Option(names = {"-d", "--dataset"}, required = false, description = "dataset path within N5 or HDF5 container, e.g. -d 'embryo_5_ch0/c0/s0' for N5 or -d '/data' for HDF5 (default for HDF5: '/data')")
 	private String dataset = null;
 
 	// output file
@@ -261,10 +262,42 @@ public class RadialSymmetry implements Callable<Void> {
 		{
 			final RandomAccessibleInterval img;
 
-			if ( isN5( image ) )
+			if ( isHDF5( image ) )
+			{
+				// Default dataset for HDF5 files is "/data"
+				final String h5dataset = ( dataset == null || dataset.length() < 1 ) ? "/data" : dataset;
+				
+				try
+				{
+					final N5HDF5Reader reader = new N5HDF5Reader( image );
+					
+					if ( !reader.datasetExists( h5dataset ) )
+					{
+						System.err.println( "ERROR: Dataset '" + h5dataset + "' not found in HDF5 file: " + image );
+						System.err.println( "Available datasets:" );
+						listHDF5Datasets( reader, "/", "  " );
+						reader.close();
+						return null;
+					}
+					
+					img = N5Utils.open( reader, h5dataset );
+					System.out.println( "Opened HDF5 file: " + image + ", dataset: " + h5dataset );
+				}
+				catch ( Exception e )
+				{
+					System.err.println( "ERROR: Failed to open HDF5 file: " + image );
+					System.err.println( "  " + e.getMessage() );
+					return null;
+				}
+			}
+			else if ( isN5( image ) )
+			{
 				img = N5Utils.open( new N5FSReader( image ), dataset );
+			}
 			else
+			{
 				img = ImagePlusImgs.from( new ImagePlus( image ) );
+			}
 
 			HelperFunctions.headless = true;
 
@@ -332,11 +365,68 @@ public class RadialSymmetry implements Callable<Void> {
 		return new File( image ).isDirectory();// e.trim().toLowerCase().endsWith( ".n5" );
 	}
 
+	protected static boolean isHDF5( final String image )
+	{
+		final String lower = image.toLowerCase();
+		return lower.endsWith( ".h5" ) || lower.endsWith( ".hdf5" );
+	}
+
+	protected static void listHDF5Datasets( final N5HDF5Reader reader, final String path, final String indent )
+	{
+		try
+		{
+			String[] children = reader.list( path );
+			if ( children != null )
+			{
+				for ( String child : children )
+				{
+					String childPath = path.equals( "/" ) ? "/" + child : path + "/" + child;
+					if ( reader.datasetExists( childPath ) )
+					{
+						long[] dims = reader.getDatasetAttributes( childPath ).getDimensions();
+						System.err.println( indent + childPath + " [" + java.util.Arrays.toString( dims ) + "]" );
+					}
+					else
+					{
+						System.err.println( indent + childPath + "/" );
+						listHDF5Datasets( reader, childPath, indent + "  " );
+					}
+				}
+			}
+		}
+		catch ( Exception e )
+		{
+			System.err.println( indent + "Error listing " + path + ": " + e.getMessage() );
+		}
+	}
+
 	protected static ImagePlus open( String image, String dataset ) throws IOException
 	{
 		final ImagePlus imp;
 
-		if ( isN5( image ) )
+		if ( isHDF5( image ) )
+		{
+			// Default dataset for HDF5 files is "/data"
+			final String h5dataset = ( dataset == null || dataset.length() < 1 ) ? "/data" : dataset;
+			
+			final N5HDF5Reader reader = new N5HDF5Reader( image );
+			
+			if ( !reader.datasetExists( h5dataset ) )
+			{
+				System.err.println( "ERROR: Dataset '" + h5dataset + "' not found in HDF5 file: " + image );
+				System.err.println( "Available datasets:" );
+				listHDF5Datasets( reader, "/", "  " );
+				reader.close();
+				throw new RuntimeException( "Dataset not found in HDF5 file" );
+			}
+			
+			RandomAccessibleInterval img = N5Utils.open( reader, h5dataset );
+			
+			imp = ImageJFunctions.wrap( img, h5dataset );
+			imp.setDimensions( 1, imp.getStackSize(), 1 );
+			System.out.println( "Opened HDF5 file: " + image + ", dataset: " + h5dataset );
+		}
+		else if ( isN5( image ) )
 		{
 			if ( dataset == null || dataset.length() < 1 )
 				throw new RuntimeException( "no dataset for the N5 container defined, please use -d 'dataset'." );
