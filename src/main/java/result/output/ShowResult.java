@@ -35,6 +35,14 @@ public class ShowResult {
 			final ArrayList<Spot> spots, final ArrayList<Long> timePoint,
 			final ArrayList<Long> channelPoint, double histThreshold, final String csvFile)
 	{
+		ransacResultCsv(spots, timePoint, channelPoint, histThreshold, csvFile, false);
+	}
+
+	public static void ransacResultCsv(
+			final ArrayList<Spot> spots, final ArrayList<Long> timePoint,
+			final ArrayList<Long> channelPoint, double histThreshold, final String csvFile,
+			final boolean swapXY)
+	{
 		if ( spots == null || spots.size() == 0 )
 		{
 			HelperFunctions.log( "No spots found, nothing to write.");
@@ -61,8 +69,18 @@ public class ShowResult {
 
 						idx++;
 
-						for (int d = 0; d < spot.numDimensions(); ++d)
-							out.print( String.format(java.util.Locale.US, "%.4f", spot.getDoublePosition(d)) + "," );
+						// Write coordinates (swap x and y if requested for HDF5 compatibility)
+						if (swapXY && spot.numDimensions() >= 2) {
+							// Write y, x, z (swapped x and y)
+							out.print( String.format(java.util.Locale.US, "%.4f", spot.getDoublePosition(1)) + "," );
+							out.print( String.format(java.util.Locale.US, "%.4f", spot.getDoublePosition(0)) + "," );
+							for (int d = 2; d < spot.numDimensions(); ++d)
+								out.print( String.format(java.util.Locale.US, "%.4f", spot.getDoublePosition(d)) + "," );
+						} else {
+							// Normal order: x, y, z
+							for (int d = 0; d < spot.numDimensions(); ++d)
+								out.print( String.format(java.util.Locale.US, "%.4f", spot.getDoublePosition(d)) + "," );
+						}
 
 						totalSpotsPerTimePoint++;
 						if (totalSpotsPerTimePoint > timePoint.get(currentTimePoint)) {
@@ -82,7 +100,7 @@ public class ShowResult {
 
 					}
 		}
-		HelperFunctions.log("Spots found = " + idx);
+		HelperFunctions.log("Spots found = " + idx + (swapXY ? " (x-y swapped)" : ""));
 		out.close();
 	}
 

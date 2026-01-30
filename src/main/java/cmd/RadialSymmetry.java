@@ -289,6 +289,9 @@ public class RadialSymmetry implements Callable<Void> {
 					System.err.println( "  " + e.getMessage() );
 					return null;
 				}
+				
+				// Enable x-y coordinate swapping for HDF5 files to match Fiji macro convention
+				params.swapXY = true;
 			}
 			else if ( isN5( image ) )
 			{

@@ -375,7 +375,7 @@ public class Radial_Symmetry implements PlugIn
 			if ( params.resultsFilePath != null && params.resultsFilePath.length() > 0 )
 			{
 				HelperFunctions.log( "Writing result to " + params.resultsFilePath );
-				Block.writeCSV( allPoints, params.resultsFilePath );
+				Block.writeCSV( allPoints, params.resultsFilePath, params.swapXY );
 			}
 		}
 	}
@@ -473,7 +473,7 @@ public class Radial_Symmetry implements PlugIn
 		else if ( mode == 1 ) { // advanced
 			// write the result to the csv file
 			if ( HelperFunctions.headless && params.resultsFilePath.length() > 0 )
-				ShowResult.ransacResultCsv(allSpots, timePoint, channelPoint, params.intensityThreshold, params.resultsFilePath );
+				ShowResult.ransacResultCsv(allSpots, timePoint, channelPoint, params.intensityThreshold, params.resultsFilePath, params.swapXY );
 
 			if ( !HelperFunctions.headless )
 				rt = lastRt = ShowResult.ransacResultTable(allSpots, timePoint, channelPoint, params.intensityThreshold );

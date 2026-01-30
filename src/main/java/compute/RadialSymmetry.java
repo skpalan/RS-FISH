@@ -747,6 +747,6 @@ public class RadialSymmetry {
 		final List<double[]> points = ShowResult.points(spots, params.intensityThreshold);
 
 		// Write to CSV
-		Block.writeCSV(points, outputFile);
+		Block.writeCSV(points, outputFile, params.swapXY);
 	}
 }

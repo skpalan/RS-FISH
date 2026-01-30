@@ -121,6 +121,9 @@ public class RadialSymParams implements Serializable {
 	// advanced output
 	public String resultsFilePath = defaultResultsFilePath;
 
+	// coordinate swapping for HDF5 compatibility with Fiji macro path
+	public boolean swapXY = false;
+
 	public void printParams() { printParams(true); }
 	public void printParams( final boolean printIntensityThreshold ) {
 		HelperFunctions.log("SigmaDoG               : " + sigma);

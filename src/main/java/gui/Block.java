@@ -113,6 +113,11 @@ public class Block implements Serializable
 
 	public static void writeCSV( final List<double[]> points, final String file )
 	{
+		writeCSV(points, file, false);
+	}
+
+	public static void writeCSV( final List<double[]> points, final String file, final boolean swapXY )
+	{
 		PrintWriter out = TextFileAccess.openFileWrite( file );
 
 		if ( points.get( 0 ).length == 4 )
@@ -121,15 +126,25 @@ public class Block implements Serializable
 			out.println("x,y,t,c,intensity");
 
 		for (double[] spot : points) {
-			for (int d = 0; d < spot.length - 1; ++d)
-				out.print( String.format(java.util.Locale.US, "%.4f", spot[ d ] ) + "," );
+			// Write coordinates (swap x and y if requested for HDF5 compatibility)
+			if (swapXY && spot.length >= 2) {
+				// Write y, x, z (swapped x and y)
+				out.print( String.format(java.util.Locale.US, "%.4f", spot[ 1 ] ) + "," );
+				out.print( String.format(java.util.Locale.US, "%.4f", spot[ 0 ] ) + "," );
+				for (int d = 2; d < spot.length - 1; ++d)
+					out.print( String.format(java.util.Locale.US, "%.4f", spot[ d ] ) + "," );
+			} else {
+				// Normal order: x, y, z
+				for (int d = 0; d < spot.length - 1; ++d)
+					out.print( String.format(java.util.Locale.US, "%.4f", spot[ d ] ) + "," );
+			}
 
 			out.print( "1,1," );
 
 			out.println(String.format(java.util.Locale.US, "%.4f", spot[ spot.length - 1 ] ) );
 		}
 
-		System.out.println(points.size() + " spots written to " + file );
+		System.out.println(points.size() + " spots written to " + file + (swapXY ? " (x-y swapped)" : "") );
 		out.close();
 	}
 
