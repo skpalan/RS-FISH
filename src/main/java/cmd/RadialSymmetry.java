@@ -24,6 +24,8 @@ package cmd;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -413,6 +415,16 @@ public class RadialSymmetry implements Callable<Void> {
 		if ( blockSize.length != dims.length )
 			throw new IllegalArgumentException( "--blockSize needs " + dims.length + " values for an image of size "
 					+ Arrays.toString( dims ) + ", got " + Arrays.toString( blockSize ) );
+
+		// with CMS (ParNew) and ParallelGC, block runs crashed the JVM (SIGSEGV inside the young-generation collector)
+		// on OpenJDK 1.8.0_504 in 1-8 of 15 repeats; with G1 none did. Whole-image runs with CMS did not crash.
+		for ( final GarbageCollectorMXBean gc : ManagementFactory.getGarbageCollectorMXBeans() )
+			if ( !gc.getName().startsWith( "G1" ) )
+			{
+				System.out.println( "WARNING: --blockSize is running with the " + gc.getName() + " garbage collector; block runs "
+						+ "crashed the JVM with CMS and ParallelGC in tests but not with G1. Start java with -XX:+UseG1GC." );
+				break;
+			}
 
 		// every block is normalized with the min/max of the whole image, never its own
 		if ( Double.isNaN( params.min ) || Double.isNaN( params.max ) )

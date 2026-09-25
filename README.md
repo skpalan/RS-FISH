@@ -164,6 +164,7 @@ rs-fish -i input.h5 -o output.csv -t 0.007 -s 1.3 -a 0.87 --blockSize 512,512,12
 - Spots from neighbouring blocks closer than 0.5 px are merged, as within one block.
 - RANSAC draws come from one shared random generator, so localizations depend on processing order: whole-image runs are repeatable, block runs are not, and differ from each other about as much as from a whole-image run.
 - Not available with `--multi_threshold` or `--interactive`.
+- **Start Java with `-XX:+UseG1GC`.** The generated `rs-fish` wrapper uses CMS (`-XX:+UseConcMarkSweepGC`). On OpenJDK 1.8.0_504, block runs with CMS or ParallelGC crashed the JVM (SIGSEGV inside the young-generation collector) in up to half of repeated runs. With G1 none did; the cause is not known. Block mode prints a warning when the JVM is not using G1.
 
 
 ### 3.	Calculating Anisotropy Coefficient<a name="anisotropy">
