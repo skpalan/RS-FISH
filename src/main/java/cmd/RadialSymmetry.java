@@ -23,9 +23,17 @@ package cmd;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import org.janelia.saalfeldlab.n5.N5FSReader;
@@ -33,6 +41,8 @@ import org.janelia.saalfeldlab.n5.N5Reader;
 import org.janelia.saalfeldlab.n5.imglib2.N5Utils;
 import org.janelia.saalfeldlab.n5.hdf5.N5HDF5Reader;
 
+import benchmark.TextFileAccess;
+import gui.Block;
 import gui.Radial_Symmetry;
 import gui.interactive.HelperFunctions;
 import ij.ImageJ;
@@ -44,6 +54,7 @@ import net.imglib2.converter.Converters;
 import net.imglib2.img.display.imagej.ImageJFunctions;
 import net.imglib2.img.imageplus.ImagePlusImgs;
 import net.imglib2.type.numeric.real.FloatType;
+import net.imglib2.util.Intervals;
 import net.imglib2.view.Views;
 import parameters.RadialSymParams;
 import picocli.CommandLine;
@@ -94,8 +105,19 @@ public class RadialSymmetry implements Callable<Void> {
 
 	@Option(names = {"--threads"}, required = false, 
 			description = "Number of threads for parallel processing. When not specified, runs single-threaded. " +
-						 "Used for: (1) DoG computation, (2) parallel processing of multiple thresholds.")
+						 "Used for: (1) DoG computation, (2) parallel processing of multiple thresholds, " +
+						 "(3) with --blockSize: number of blocks processed in parallel.")
 	private Integer threads = null;
+
+	@Option(names = {"-bs", "--blockSize"}, required = false, split = ",",
+			description = "Process the image in blocks of this size instead of all at once, one value per image dimension " +
+						 "in the order of the opened image (for HDF5 the reverse of the dataset order, e.g. Y,X,Z for a Z,X,Y dataset), " +
+						 "e.g. --blockSize 512,512,128. Blocks overlap by 2 pixels and read their surroundings from the full image, " +
+						 "so DoG values and gradients are those of whole-image processing; min/max normalization is computed once " +
+						 "for the whole image. Memory scales with block size x --threads instead of image size. " +
+						 "RANSAC draws depend on block order, so results can differ slightly from whole-image runs. " +
+						 "Not available with --multi_threshold or --interactive. (default: off)")
+	private int[] blockSize = null;
 
 	@Option(names = {"--random-seed"}, required = false, 
 			description = "Random seed for RANSAC reproducibility (default: random). " +
@@ -182,6 +204,15 @@ public class RadialSymmetry implements Callable<Void> {
 				throw new IllegalArgumentException(
 					"Invalid --multi_threshold format. Use comma-separated numbers, e.g., 0.005,0.007,0.01");
 			}
+		}
+
+		if ( blockSize != null )
+		{
+			if ( thresholds != null || interactive )
+				throw new IllegalArgumentException( "--blockSize cannot be combined with --multi_threshold or --interactive" );
+			for ( final int b : blockSize )
+				if ( b < 3 )
+					throw new IllegalArgumentException( "--blockSize values must be >= 3, got " + Arrays.toString( blockSize ) );
 		}
 
 		// Set random seed if specified
@@ -348,6 +379,8 @@ public class RadialSymmetry implements Callable<Void> {
 				numThreads);
 
 			System.out.println("=== Complete ===");
+			} else if ( blockSize != null ) {
+				runBlocks( img, params, blockSize, numThreads, output );
 			} else {
 				// Original single-threshold mode
 				Radial_Symmetry.runRSFISH(
@@ -361,6 +394,157 @@ public class RadialSymmetry implements Callable<Void> {
 		}
 
 		return null;
+	}
+
+	/**
+	 * Runs RS-FISH block by block ({@link Block#splitIntoBlocks}), like the Fiji plugin with "Use_multithreading":
+	 * each block computes DoG, gradients and RANSAC for its own interval but reads the full (lazily loaded) image
+	 * around it, so memory scales with block size x numThreads instead of image size.
+	 */
+	@SuppressWarnings({ "rawtypes", "unchecked" })
+	protected static void runBlocks(
+			final RandomAccessibleInterval img,
+			final RadialSymParams params,
+			final int[] blockSize,
+			final int numThreads,
+			final String output ) throws Exception
+	{
+		final long[] dims = Intervals.dimensionsAsLongArray( img );
+		if ( blockSize.length != dims.length )
+			throw new IllegalArgumentException( "--blockSize needs " + dims.length + " values for an image of size "
+					+ Arrays.toString( dims ) + ", got " + Arrays.toString( blockSize ) );
+
+		// every block is normalized with the min/max of the whole image, never its own
+		if ( Double.isNaN( params.min ) || Double.isNaN( params.max ) )
+		{
+			final double[] minmax = HelperFunctions.computeMinMax( img );
+			if ( Double.isNaN( params.min ) )
+				params.min = minmax[ 0 ];
+			if ( Double.isNaN( params.max ) )
+				params.max = minmax[ 1 ];
+		}
+		params.autoMinMax = false;
+
+		final ArrayList< Block > blocks = Block.splitIntoBlocks( new FinalInterval( img ), blockSize );
+		HelperFunctions.log( "Block mode: image " + Arrays.toString( dims ) + ", " + blocks.size() + " blocks of "
+				+ Arrays.toString( blockSize ) + ", " + numThreads + " in parallel, img min=" + params.min + ", max=" + params.max );
+
+		// blocks must neither write the CSV themselves nor multi-thread their DoG
+		params.resultsFilePath = "";
+		params.numThreads = 1;
+
+		final RandomAccessible extended = Views.extendMirrorSingle( img );
+		final FinalInterval globalInterval = new FinalInterval( img );
+		final AtomicInteger next = new AtomicInteger();
+		final AtomicInteger done = new AtomicInteger();
+		final long start = System.currentTimeMillis();
+
+		final List< Callable< List< double[] > > > tasks = new ArrayList<>();
+		for ( int t = 0; t < numThreads; ++t )
+			tasks.add( () ->
+			{
+				final List< double[] > points = new ArrayList<>();
+				for ( int b = next.getAndIncrement(); b < blocks.size(); b = next.getAndIncrement() )
+				{
+					points.addAll( Radial_Symmetry.runRSFISH( extended, globalInterval, blocks.get( b ).createInterval(), params ) );
+					final int d = done.incrementAndGet();
+					if ( d % 25 == 0 || d == blocks.size() )
+						System.out.println( "Blocks done: " + d + "/" + blocks.size() + " (" + ( System.currentTimeMillis() - start ) / 1000 + " s)" );
+				}
+				return points;
+			} );
+
+		final List< double[] > points = new ArrayList<>();
+		final ExecutorService service = Executors.newFixedThreadPool( numThreads );
+		try
+		{
+			for ( final Future< List< double[] > > f : service.invokeAll( tasks ) )
+				points.addAll( f.get() );
+		}
+		finally
+		{
+			service.shutdown();
+		}
+
+		final int removed = removeDoubleDetections( points, dims.length, 0.5 );
+		HelperFunctions.log( "Removed " + removed + " double detections across block borders (dist < 0.5 px), " + points.size() + " spots remain" );
+
+		if ( points.isEmpty() )
+		{
+			HelperFunctions.log( "No spots found, writing header only." );
+			final PrintWriter out = TextFileAccess.openFileWrite( output );
+			out.println( dims.length == 3 ? "x,y,z,t,c,intensity" : "x,y,t,c,intensity" );
+			out.close();
+		}
+		else
+		{
+			Block.writeCSV( points, output, params.swapXY );
+		}
+	}
+
+	/**
+	 * Removes points closer than {@code threshold} pixels to a point later in the list and keeps the later one, as
+	 * compute.RadialSymmetry.filterDoubleDetections does for a pair. Blocks already filter their own spots, so this
+	 * only acts on pairs that straddle a block border. The remaining points keep their order.
+	 *
+	 * @param points spots as (position[0..n-1], intensity), modified in place
+	 * @return number of removed points
+	 */
+	protected static int removeDoubleDetections( final List< double[] > points, final int n, final double threshold )
+	{
+		final int size = points.size();
+		final double t2 = threshold * threshold;
+		final Map< Long, List< double[] > > grid = new HashMap<>();
+		final boolean[] keep = new boolean[ size ];
+		final long[] cell = new long[ n ];
+
+		for ( int i = size - 1; i >= 0; --i )
+		{
+			final double[] p = points.get( i );
+			for ( int d = 0; d < n; ++d )
+				cell[ d ] = (long)Math.floor( p[ d ] / threshold );
+
+			boolean close = false;
+			final int numNeighbors = (int)Math.pow( 3, n );
+			for ( int k = 0; k < numNeighbors && !close; ++k )
+			{
+				long key = 0;
+				for ( int d = 0, r = k; d < n; ++d, r /= 3 )
+					key = ( key << 21 ) | ( ( cell[ d ] + r % 3 - 1 + ( 1 << 20 ) ) & 0x1FFFFF );
+
+				final List< double[] > occupants = grid.get( key );
+				if ( occupants != null )
+					for ( final double[] q : occupants )
+					{
+						double dist2 = 0;
+						for ( int d = 0; d < n; ++d )
+							dist2 += ( p[ d ] - q[ d ] ) * ( p[ d ] - q[ d ] );
+						if ( dist2 < t2 )
+						{
+							close = true;
+							break;
+						}
+					}
+			}
+
+			if ( !close )
+			{
+				long key = 0;
+				for ( int d = 0; d < n; ++d )
+					key = ( key << 21 ) | ( ( cell[ d ] + ( 1 << 20 ) ) & 0x1FFFFF );
+				grid.computeIfAbsent( key, x -> new ArrayList<>() ).add( p );
+				keep[ i ] = true;
+			}
+		}
+
+		final ArrayList< double[] > kept = new ArrayList<>( size );
+		for ( int i = 0; i < size; ++i )
+			if ( keep[ i ] )
+				kept.add( points.get( i ) );
+
+		points.clear();
+		points.addAll( kept );
+		return size - kept.size();
 	}
 
 	protected static boolean isN5( final String image )

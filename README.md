@@ -150,6 +150,21 @@ For a typical 3D image with 3 thresholds:
 - Each threshold produces a separate CSV file with detections
 - Results are identical to running RS-FISH separately for each threshold
 
+#### 2.4. Block Processing for Large Images
+
+By default the command line runs DoG on the whole image at once, which holds two float32 copies of the image in memory (8 bytes per voxel) plus every candidate spot. For images larger than the Java heap, `--blockSize` processes the image in blocks, as the Fiji plugin does with *Use multithreading*:
+
+```bash
+rs-fish -i input.h5 -o output.csv -t 0.007 -s 1.3 -a 0.87 --blockSize 512,512,128 --threads 32
+```
+
+- One value per image dimension, in the order of the opened image. HDF5 datasets are opened in reverse order, so a `(Z, X, Y)` dataset takes `Y,X,Z`.
+- Blocks overlap by 2 pixels and read their surroundings from the full image, so DoG values and gradients are those of whole-image processing. Min/max normalization is computed once for the whole image (or taken from `-i0/-i1`).
+- `--threads` is the number of blocks processed in parallel; the DoG inside a block is single-threaded. Memory scales with block size × threads instead of image size.
+- Spots from neighbouring blocks closer than 0.5 px are merged, as within one block.
+- RANSAC draws come from one shared random generator, so localizations depend on processing order: whole-image runs are repeatable, block runs are not, and differ from each other about as much as from a whole-image run.
+- Not available with `--multi_threshold` or `--interactive`.
+
 
 ### 3.	Calculating Anisotropy Coefficient<a name="anisotropy">
 </a> 
