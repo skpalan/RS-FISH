@@ -160,11 +160,12 @@ rs-fish -i input.h5 -o output.csv -t 0.007 -s 1.3 -a 0.87 --blockSize 512,512,12
 
 - One value per image dimension, in the order of the opened image. HDF5 datasets are opened in reverse order, so a `(Z, X, Y)` dataset takes `Y,X,Z`.
 - Blocks overlap by 2 pixels and read their surroundings from the full image, so DoG values and gradients are those of whole-image processing. Min/max normalization is computed once for the whole image (or taken from `-i0/-i1`).
-- `--threads` is the number of blocks processed in parallel; the DoG inside a block is single-threaded. Memory scales with block size × threads instead of image size.
+- `--threads` is the number of blocks processed in parallel; the DoG inside a block is single-threaded. Memory scales with block size × threads instead of image size: the cache of image cells read from the file keeps at most the heap that the running blocks (16 bytes per block voxel each), 2 GB and a 25% margin leave. Evicted cells are read again. On a 1.04 × 10¹⁰-voxel section with a 20 GB heap, an unbounded cache ran out of memory near the last block; bounded, the run finished.
 - Spots from neighbouring blocks closer than 0.5 px are merged, as within one block.
 - RANSAC draws come from one shared random generator, so localizations depend on processing order: whole-image runs are repeatable, block runs are not, and differ from each other about as much as from a whole-image run.
 - Not available with `--multi_threshold` or `--interactive`.
 - **Start Java with `-XX:+UseG1GC`.** The generated `rs-fish` wrapper uses CMS (`-XX:+UseConcMarkSweepGC`). On OpenJDK 1.8.0_504, block runs with CMS or ParallelGC crashed the JVM (SIGSEGV inside the young-generation collector) in up to half of repeated runs. With G1 none did; the cause is not known. Block mode prints a warning when the JVM is not using G1.
+- A run that fails (for example with `OutOfMemoryError` in a block) exits with a non-zero status. Before, worker threads left behind could keep the JVM running indefinitely.
 
 
 ### 3.	Calculating Anisotropy Coefficient<a name="anisotropy">

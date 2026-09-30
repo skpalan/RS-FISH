@@ -38,6 +38,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
+import org.janelia.saalfeldlab.n5.DataType;
+import org.janelia.saalfeldlab.n5.DatasetAttributes;
 import org.janelia.saalfeldlab.n5.N5FSReader;
 import org.janelia.saalfeldlab.n5.N5Reader;
 import org.janelia.saalfeldlab.n5.imglib2.N5Utils;
@@ -313,7 +315,7 @@ public class RadialSymmetry implements Callable<Void> {
 						return null;
 					}
 					
-					img = N5Utils.open( reader, h5dataset );
+					img = openLazy( reader, h5dataset, blockSize, numThreads );
 					System.out.println( "Opened HDF5 file: " + image + ", dataset: " + h5dataset );
 				}
 				catch ( Exception e )
@@ -328,7 +330,7 @@ public class RadialSymmetry implements Callable<Void> {
 			}
 			else if ( isN5( image ) )
 			{
-				img = N5Utils.open( new N5FSReader( image ), dataset );
+				img = openLazy( new N5FSReader( image ), dataset, blockSize, numThreads );
 			}
 			else
 			{
@@ -644,7 +646,59 @@ public class RadialSymmetry implements Callable<Void> {
 		return imp;
 	}
 
+	/** Block mode: heap share left free as a margin (the cell cache never grows into it). */
+	protected static final double BLOCK_HEAP_MARGIN_FRACTION = 0.25;
+	/** Block mode: heap per voxel of a block being processed (DoG + temp + candidates + garbage), measured. */
+	protected static final long BLOCK_BYTES_PER_VOXEL = 16;
+	/** Block mode: heap for the JVM itself and the merged spot list. */
+	protected static final long BLOCK_HEAP_RESERVE_BYTES = 2L << 30;
+
+	/**
+	 * Opens an N5/HDF5 dataset lazily. Whole-image mode keeps the default cache, which holds every loaded cell softly.
+	 * Block mode reads the whole image too, and with that cache a 1.04e10-voxel image (20.7 GB of uint16 cells) ran
+	 * out of memory near its last block on a 20 GB heap instead of dropping cells. So in block mode the cache holds at
+	 * most the heap left after the running blocks ({@code numThreads} x {@link #BLOCK_BYTES_PER_VOXEL} x block voxels),
+	 * {@link #BLOCK_HEAP_RESERVE_BYTES} and a {@link #BLOCK_HEAP_MARGIN_FRACTION} margin; evicted cells are read again.
+	 */
+	@SuppressWarnings( "rawtypes" )
+	protected static RandomAccessibleInterval openLazy( final N5Reader reader, final String dataset, final int[] blockSize, final int numThreads )
+	{
+		if ( blockSize == null )
+			return N5Utils.open( reader, dataset );
+
+		final DatasetAttributes attributes = reader.getDatasetAttributes( dataset );
+		final long[] dims = attributes.getDimensions();
+		long cellBytes = bytesPerElement( attributes.getDataType() );
+		for ( final int b : attributes.getBlockSize() )
+			cellBytes *= b;
+		long blockVoxels = 1;
+		for ( int d = 0; d < dims.length && d < blockSize.length; ++d )
+			blockVoxels *= Math.min( blockSize[ d ], dims[ d ] );
+
+		final long heap = Runtime.getRuntime().maxMemory();
+		final long budget = (long)( heap * ( 1 - BLOCK_HEAP_MARGIN_FRACTION ) ) - BLOCK_HEAP_RESERVE_BYTES
+				- (long)numThreads * BLOCK_BYTES_PER_VOXEL * blockVoxels;
+		final int maxCells = (int)Math.max( 64, Math.min( Integer.MAX_VALUE, budget / cellBytes ) );
+		System.out.println( "Block mode: caching at most " + maxCells + " image cells ("
+				+ String.format( java.util.Locale.US, "%.1f", maxCells * cellBytes / 1e9 ) + " GB)" );
+		return N5Utils.openWithBoundedSoftRefCache( reader, dataset, maxCells );
+	}
+
+	protected static int bytesPerElement( final DataType type )
+	{
+		switch ( type )
+		{
+		case INT8: case UINT8: return 1;
+		case INT16: case UINT16: return 2;
+		case INT32: case UINT32: case FLOAT32: return 4;
+		default: return 8;
+		}
+	}
+
 	public static final void main(final String... args) {
-		new CommandLine( new RadialSymmetry() ).execute( args );
+		final int exitCode = new CommandLine( new RadialSymmetry() ).execute( args );
+		// a failed run (e.g. OutOfMemoryError in a block) can leave pool threads alive that keep the JVM from exiting
+		if ( exitCode != 0 )
+			System.exit( exitCode );
 	}
 }
